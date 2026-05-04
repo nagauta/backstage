@@ -12,9 +12,24 @@ import {
   saveBands,
 } from "@/lib/flyerStore";
 
+type VerifyEventInfo = {
+  found: boolean;
+  title: string;
+  date: string;
+  venue: string;
+  sourceUrl: string;
+  lineupConsistent: boolean;
+};
+
 type AnalyzeEvent =
   | { type: "phase"; step: string; msg: string }
   | { type: "vision_done"; names: string[] }
+  | {
+      type: "verify_done";
+      verified: string[];
+      dropped: { name: string; reason: string }[];
+      event: VerifyEventInfo;
+    }
   | { type: "band_start"; index: number; name: string }
   | { type: "band_step"; index: number; msg: string }
   | { type: "band_done"; index: number; band: Band }
@@ -156,6 +171,16 @@ export default function AnalyzingPage() {
               case "vision_done":
                 setRows(
                   event.names.map((name, i) => ({
+                    index: i,
+                    name,
+                    status: "pending",
+                  })),
+                );
+                break;
+              case "verify_done":
+                // verified の順序で rows を再構築 (research 側の index と一致させる)
+                setRows(
+                  event.verified.map((name, i) => ({
                     index: i,
                     name,
                     status: "pending",

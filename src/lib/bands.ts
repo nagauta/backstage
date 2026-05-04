@@ -8,6 +8,7 @@ export type Track = {
 export type QA = {
   q: string;
   a: string;
+  source?: string;
 };
 
 export type RelatedLink = {
@@ -29,6 +30,7 @@ export type Band = {
     gradientTo: string;
     accent: string;
   };
+  photoUrl?: string;
   bio: string;
   interview: QA[];
   tracks: Track[];

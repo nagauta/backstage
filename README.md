@@ -1,20 +1,32 @@
 This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
 
-## Getting Started
+## Backstage
 
-First, run the development server:
+ライブのフライヤー画像をアップロードすると、サーバ側で OpenAI の vision + web_search を使って出演バンドを実調査し、プロフィール / インタビュー抜粋を表示するアプリ。
+
+現在は M1 (1 バンドのみ調査) スコープ。複数フライヤーの並列処理は未実装。
+
+### セットアップ
+
+1. `.env.example` をコピーして `.env.local` を作成。`OPENAI_API_KEY` を埋める:
+   ```bash
+   cp .env.example .env.local
+   # その後 .env.local を編集
+   ```
+2. 依存をインストール:
+   ```bash
+   npm install
+   ```
+
+### 起動
 
 ```bash
 npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
 ```
 
 Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+
+API キー無しでも「画像なしでデモを試す」ボタンから固定サンプルバンドの UI 動作確認は可能。
 
 You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
 

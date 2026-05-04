@@ -1,55 +1,109 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { useRouter } from "next/navigation";
 import Image from "next/image";
-import { BANDS } from "@/lib/bands";
-import { loadFlyerDataUrl } from "@/lib/flyerStore";
+import { BANDS, type Band } from "@/lib/bands";
+import {
+  bandsStore,
+  clearFlyerDataUrl,
+  flyerStore,
+  loadFlyerDataUrl,
+  saveBands,
+} from "@/lib/flyerStore";
 
 const STEPS = [
   "フライヤーを解析中…",
   "出演バンドを抽出中…",
-  "プロフィールを取得中…",
-  "インタビューを編集中…",
+  "ディープリサーチ実行中…",
+  "プロフィールを編集中…",
 ];
+
+type ApiOk = { ok: true; bands: Band[]; warnings?: string[] };
+type ApiErr = { ok: false; error: string };
 
 export default function AnalyzingPage() {
   const router = useRouter();
-  const [flyer, setFlyer] = useState<string | null>(null);
+  const flyer = useSyncExternalStore(
+    flyerStore.subscribe,
+    flyerStore.getSnapshot,
+    flyerStore.getServerSnapshot,
+  );
   const [stepIndex, setStepIndex] = useState(0);
-  const [detectedCount, setDetectedCount] = useState(0);
-
-  useEffect(() => {
-    setFlyer(loadFlyerDataUrl());
-  }, []);
+  const [detected, setDetected] = useState<Band[]>([]);
+  const [error, setError] = useState<string | null>(null);
+  const startedRef = useRef(false);
 
   useEffect(() => {
     const stepTimer = setInterval(() => {
       setStepIndex((i) => (i + 1) % STEPS.length);
-    }, 900);
+    }, 1100);
     return () => clearInterval(stepTimer);
   }, []);
 
   useEffect(() => {
-    const total = BANDS.length;
-    const intervals: ReturnType<typeof setTimeout>[] = [];
-    for (let i = 1; i <= total; i++) {
-      intervals.push(
-        setTimeout(() => {
-          setDetectedCount(i);
-        }, 600 + i * 700),
-      );
+    if (startedRef.current) return;
+    startedRef.current = true;
+
+    // 既に解析済みの結果があれば再実行せず /bands へ
+    const existing = bandsStore.getSnapshot();
+    if (existing && existing.length > 0) {
+      router.replace("/bands");
+      return;
     }
-    const finish = setTimeout(
-      () => {
-        router.push("/bands");
-      },
-      600 + (total + 1) * 700,
-    );
-    return () => {
-      intervals.forEach(clearTimeout);
-      clearTimeout(finish);
-    };
+
+    const flyerData = loadFlyerDataUrl();
+
+    // Demo mode: 画像なしの場合は静的データで動作確認
+    if (!flyerData) {
+      const total = BANDS.length;
+      const timers: ReturnType<typeof setTimeout>[] = [];
+      for (let i = 1; i <= total; i++) {
+        timers.push(
+          setTimeout(() => setDetected(BANDS.slice(0, i)), 600 + i * 700),
+        );
+      }
+      const finish = setTimeout(
+        () => {
+          saveBands(BANDS);
+          router.push("/bands");
+        },
+        600 + (total + 1) * 700,
+      );
+      return () => {
+        timers.forEach(clearTimeout);
+        clearTimeout(finish);
+      };
+    }
+
+    // 実モード: /api/analyze を呼ぶ
+    const controller = new AbortController();
+    (async () => {
+      try {
+        const res = await fetch("/api/analyze", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ image: flyerData }),
+          signal: controller.signal,
+        });
+        const data = (await res.json()) as ApiOk | ApiErr;
+        if (!data.ok) {
+          setError(data.error);
+          return;
+        }
+        setDetected(data.bands);
+        saveBands(data.bands);
+        // 同じ画像で再実行されないように flyer をクリア
+        clearFlyerDataUrl();
+        // 演出として一拍置く
+        setTimeout(() => router.push("/bands"), 800);
+      } catch (e) {
+        if ((e as Error).name === "AbortError") return;
+        setError((e as Error).message);
+      }
+    })();
+
+    return () => controller.abort();
   }, [router]);
 
   return (
@@ -84,28 +138,49 @@ export default function AnalyzingPage() {
       </div>
 
       <div className="mt-8">
-        <p className="font-mono text-sm text-rose-400">{STEPS[stepIndex]}</p>
-        <p className="mt-2 text-xs text-zinc-500">
-          ※ これはモックです。実際の解析は行われていません。
+        <p className="font-mono text-sm text-rose-400">
+          {error ? "解析に失敗しました" : STEPS[stepIndex]}
         </p>
+        {flyer ? (
+          <p className="mt-2 text-xs text-zinc-500">
+            実際にバンドを Web 検索しています。30 秒〜数分かかることがあります。
+          </p>
+        ) : (
+          <p className="mt-2 text-xs text-zinc-500">
+            ※ デモモード(画像なし)。固定のサンプルバンドを表示します。
+          </p>
+        )}
       </div>
 
+      {error && (
+        <div className="mt-6 rounded-xl border border-red-500/40 bg-red-500/10 p-4 text-sm text-red-200">
+          <p className="font-semibold">エラー:</p>
+          <p className="mt-1 break-words text-xs">{error}</p>
+          <button
+            onClick={() => router.push("/")}
+            className="mt-3 rounded-full border border-red-400/60 px-3 py-1 text-xs hover:bg-red-500/20"
+          >
+            ホームに戻る
+          </button>
+        </div>
+      )}
+
       <ul className="mt-8 space-y-3">
-        {BANDS.slice(0, detectedCount).map((band) => (
+        {detected.map((band) => (
           <li
             key={band.id}
             className="animate-fade-up flex items-center gap-3 rounded-xl border border-zinc-800 bg-zinc-900/60 px-4 py-3"
           >
             <span className="font-mono text-xs text-emerald-400">DETECTED</span>
-            <span className="text-sm font-semibold text-white">
-              {band.name}
-            </span>
-            <span className="ml-auto text-[10px] uppercase tracking-widest text-zinc-500">
-              {band.genres[0]}
-            </span>
+            <span className="text-sm font-semibold text-white">{band.name}</span>
+            {band.genres[0] && (
+              <span className="ml-auto text-[10px] uppercase tracking-widest text-zinc-500">
+                {band.genres[0]}
+              </span>
+            )}
           </li>
         ))}
-        {detectedCount < BANDS.length && (
+        {!error && detected.length === 0 && (
           <li className="flex items-center gap-3 rounded-xl border border-dashed border-zinc-700 bg-transparent px-4 py-3 text-zinc-500">
             <span className="inline-block h-3 w-3 animate-spin rounded-full border-2 border-zinc-600 border-t-rose-400" />
             <span className="text-sm">searching…</span>

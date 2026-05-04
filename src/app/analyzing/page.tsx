@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState, useSyncExternalStore } from "react";
+import { useEffect, useState, useSyncExternalStore } from "react";
 import { useRouter } from "next/navigation";
 import Image from "next/image";
 import { BANDS, type Band } from "@/lib/bands";
@@ -12,15 +12,25 @@ import {
   saveBands,
 } from "@/lib/flyerStore";
 
-const STEPS = [
-  "フライヤーを解析中…",
-  "出演バンドを抽出中…",
-  "ディープリサーチ実行中…",
-  "プロフィールを編集中…",
-];
+type AnalyzeEvent =
+  | { type: "phase"; step: string; msg: string }
+  | { type: "vision_done"; names: string[] }
+  | { type: "band_start"; index: number; name: string }
+  | { type: "band_step"; index: number; msg: string }
+  | { type: "band_done"; index: number; band: Band }
+  | { type: "band_failed"; index: number; name: string; error: string }
+  | { type: "done"; bands: Band[]; warnings: string[] }
+  | { type: "fatal"; error: string };
 
-type ApiOk = { ok: true; bands: Band[]; warnings?: string[] };
-type ApiErr = { ok: false; error: string };
+type RowStatus = "pending" | "running" | "done" | "failed";
+type BandRow = {
+  index: number;
+  name: string;
+  status: RowStatus;
+  step?: string;
+  band?: Band;
+  error?: string;
+};
 
 export default function AnalyzingPage() {
   const router = useRouter();
@@ -29,22 +39,11 @@ export default function AnalyzingPage() {
     flyerStore.getSnapshot,
     flyerStore.getServerSnapshot,
   );
-  const [stepIndex, setStepIndex] = useState(0);
-  const [detected, setDetected] = useState<Band[]>([]);
+  const [phaseMsg, setPhaseMsg] = useState<string>("接続中…");
+  const [rows, setRows] = useState<BandRow[]>([]);
   const [error, setError] = useState<string | null>(null);
-  const startedRef = useRef(false);
 
   useEffect(() => {
-    const stepTimer = setInterval(() => {
-      setStepIndex((i) => (i + 1) % STEPS.length);
-    }, 1100);
-    return () => clearInterval(stepTimer);
-  }, []);
-
-  useEffect(() => {
-    if (startedRef.current) return;
-    startedRef.current = true;
-
     // 既に解析済みの結果があれば再実行せず /bands へ
     const existing = bandsStore.getSnapshot();
     if (existing && existing.length > 0) {
@@ -53,31 +52,53 @@ export default function AnalyzingPage() {
     }
 
     const flyerData = loadFlyerDataUrl();
+    let cancelled = false;
 
     // Demo mode: 画像なしの場合は静的データで動作確認
     if (!flyerData) {
       const total = BANDS.length;
+      const initTimer = setTimeout(() => {
+        if (cancelled) return;
+        setPhaseMsg("デモモード: サンプルバンドを表示中…");
+        setRows(
+          BANDS.map((b, i) => ({ index: i, name: b.name, status: "pending" })),
+        );
+      }, 0);
       const timers: ReturnType<typeof setTimeout>[] = [];
-      for (let i = 1; i <= total; i++) {
+      for (let i = 0; i < total; i++) {
         timers.push(
-          setTimeout(() => setDetected(BANDS.slice(0, i)), 600 + i * 700),
+          setTimeout(
+            () => {
+              if (cancelled) return;
+              setRows((rs) =>
+                rs.map((r) =>
+                  r.index === i ? { ...r, status: "done", band: BANDS[i] } : r,
+                ),
+              );
+            },
+            600 + (i + 1) * 700,
+          ),
         );
       }
       const finish = setTimeout(
         () => {
+          if (cancelled) return;
           saveBands(BANDS);
           router.push("/bands");
         },
         600 + (total + 1) * 700,
       );
       return () => {
+        cancelled = true;
+        clearTimeout(initTimer);
         timers.forEach(clearTimeout);
         clearTimeout(finish);
       };
     }
 
-    // 実モード: /api/analyze を呼ぶ
+    // 実モード: SSE で /api/analyze から進捗を受け取る
     const controller = new AbortController();
+
     (async () => {
       try {
         const res = await fetch("/api/analyze", {
@@ -86,24 +107,136 @@ export default function AnalyzingPage() {
           body: JSON.stringify({ image: flyerData }),
           signal: controller.signal,
         });
-        const data = (await res.json()) as ApiOk | ApiErr;
-        if (!data.ok) {
-          setError(data.error);
+
+        if (!res.ok) {
+          const data = (await res.json().catch(() => null)) as
+            | { error?: string }
+            | null;
+          if (!cancelled) setError(data?.error ?? `HTTP ${res.status}`);
           return;
         }
-        setDetected(data.bands);
-        saveBands(data.bands);
-        // 同じ画像で再実行されないように flyer をクリア
-        clearFlyerDataUrl();
-        // 演出として一拍置く
-        setTimeout(() => router.push("/bands"), 800);
+
+        if (!res.body) {
+          if (!cancelled) setError("response body is empty");
+          return;
+        }
+
+        const reader = res.body.getReader();
+        const decoder = new TextDecoder();
+        let buf = "";
+        let finalBands: Band[] | null = null;
+
+        while (!cancelled) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          buf += decoder.decode(value, { stream: true });
+
+          let sep: number;
+          while ((sep = buf.indexOf("\n\n")) !== -1) {
+            const chunk = buf.slice(0, sep);
+            buf = buf.slice(sep + 2);
+            const data = chunk
+              .split("\n")
+              .filter((l) => l.startsWith("data:"))
+              .map((l) => l.slice(5).replace(/^\s/, ""))
+              .join("\n");
+            if (!data) continue;
+            let event: AnalyzeEvent;
+            try {
+              event = JSON.parse(data) as AnalyzeEvent;
+            } catch (e) {
+              console.warn("failed to parse SSE event", data, e);
+              continue;
+            }
+            if (cancelled) break;
+            switch (event.type) {
+              case "phase":
+                setPhaseMsg(event.msg);
+                break;
+              case "vision_done":
+                setRows(
+                  event.names.map((name, i) => ({
+                    index: i,
+                    name,
+                    status: "pending",
+                  })),
+                );
+                break;
+              case "band_start":
+                setRows((rs) =>
+                  rs.map((r) =>
+                    r.index === event.index
+                      ? { ...r, status: "running", step: "開始" }
+                      : r,
+                  ),
+                );
+                break;
+              case "band_step":
+                setRows((rs) =>
+                  rs.map((r) =>
+                    r.index === event.index ? { ...r, step: event.msg } : r,
+                  ),
+                );
+                break;
+              case "band_done":
+                setRows((rs) =>
+                  rs.map((r) =>
+                    r.index === event.index
+                      ? {
+                          ...r,
+                          status: "done",
+                          step: undefined,
+                          band: event.band,
+                        }
+                      : r,
+                  ),
+                );
+                break;
+              case "band_failed":
+                setRows((rs) =>
+                  rs.map((r) =>
+                    r.index === event.index
+                      ? {
+                          ...r,
+                          status: "failed",
+                          step: undefined,
+                          error: event.error,
+                        }
+                      : r,
+                  ),
+                );
+                break;
+              case "done":
+                finalBands = event.bands;
+                setPhaseMsg("完了!");
+                break;
+              case "fatal":
+                setError(event.error);
+                break;
+            }
+          }
+        }
+
+        if (cancelled) return;
+
+        if (finalBands && finalBands.length > 0) {
+          saveBands(finalBands);
+          clearFlyerDataUrl();
+          setTimeout(() => {
+            if (!cancelled) router.push("/bands");
+          }, 600);
+        }
       } catch (e) {
         if ((e as Error).name === "AbortError") return;
+        if (cancelled) return;
         setError((e as Error).message);
       }
     })();
 
-    return () => controller.abort();
+    return () => {
+      cancelled = true;
+      controller.abort();
+    };
   }, [router]);
 
   return (
@@ -139,13 +272,9 @@ export default function AnalyzingPage() {
 
       <div className="mt-8">
         <p className="font-mono text-sm text-rose-400">
-          {error ? "解析に失敗しました" : STEPS[stepIndex]}
+          {error ? "解析に失敗しました" : phaseMsg}
         </p>
-        {flyer ? (
-          <p className="mt-2 text-xs text-zinc-500">
-            実際にバンドを Web 検索しています。30 秒〜数分かかることがあります。
-          </p>
-        ) : (
+        {!flyer && !error && (
           <p className="mt-2 text-xs text-zinc-500">
             ※ デモモード(画像なし)。固定のサンプルバンドを表示します。
           </p>
@@ -166,21 +295,26 @@ export default function AnalyzingPage() {
       )}
 
       <ul className="mt-8 space-y-3">
-        {detected.map((band) => (
+        {rows.map((row) => (
           <li
-            key={band.id}
+            key={row.index}
             className="animate-fade-up flex items-center gap-3 rounded-xl border border-zinc-800 bg-zinc-900/60 px-4 py-3"
           >
-            <span className="font-mono text-xs text-emerald-400">DETECTED</span>
-            <span className="text-sm font-semibold text-white">{band.name}</span>
-            {band.genres[0] && (
-              <span className="ml-auto text-[10px] uppercase tracking-widest text-zinc-500">
-                {band.genres[0]}
-              </span>
-            )}
+            <StatusBadge status={row.status} />
+            <span
+              className={`text-sm font-semibold ${row.status === "failed" ? "text-zinc-400 line-through" : "text-white"}`}
+            >
+              {row.name}
+            </span>
+            <span className="ml-auto truncate text-[11px] text-zinc-500">
+              {row.status === "running" && (row.step ?? "処理中…")}
+              {row.status === "done" && (row.band?.genres[0] ?? "done")}
+              {row.status === "failed" && "失敗"}
+              {row.status === "pending" && "待機中"}
+            </span>
           </li>
         ))}
-        {!error && detected.length === 0 && (
+        {rows.length === 0 && !error && (
           <li className="flex items-center gap-3 rounded-xl border border-dashed border-zinc-700 bg-transparent px-4 py-3 text-zinc-500">
             <span className="inline-block h-3 w-3 animate-spin rounded-full border-2 border-zinc-600 border-t-rose-400" />
             <span className="text-sm">searching…</span>
@@ -203,4 +337,24 @@ export default function AnalyzingPage() {
       `}</style>
     </main>
   );
+}
+
+function StatusBadge({ status }: { status: RowStatus }) {
+  if (status === "done") {
+    return (
+      <span className="font-mono text-xs text-emerald-400">DONE</span>
+    );
+  }
+  if (status === "running") {
+    return (
+      <span className="inline-flex items-center gap-1 font-mono text-xs text-rose-300">
+        <span className="inline-block h-2.5 w-2.5 animate-spin rounded-full border-2 border-rose-300/30 border-t-rose-300" />
+        RUN
+      </span>
+    );
+  }
+  if (status === "failed") {
+    return <span className="font-mono text-xs text-red-400">FAIL</span>;
+  }
+  return <span className="font-mono text-xs text-zinc-500">···</span>;
 }

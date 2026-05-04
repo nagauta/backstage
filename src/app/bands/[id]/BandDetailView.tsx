@@ -1,11 +1,11 @@
 "use client";
 
-import Image from "next/image";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import { BANDS } from "@/lib/bands";
 import { bandsStore } from "@/lib/flyerStore";
+import { BandPhoto } from "@/components/BandPhoto";
 
 type Props = { bandId: string };
 
@@ -92,19 +92,8 @@ export default function BandDetailView({ bandId }: Props) {
       <header
         className={`relative h-[320px] w-full overflow-hidden bg-gradient-to-br ${band.hero.gradientFrom} ${band.hero.gradientTo}`}
       >
-        {band.photoUrl ? (
-          <Image
-            src={band.photoUrl}
-            alt={`${band.name} アー写`}
-            fill
-            sizes="(max-width: 480px) 100vw, 430px"
-            className="object-cover"
-            priority
-            unoptimized
-          />
-        ) : (
-          <div className="absolute inset-0 bg-[radial-gradient(circle_at_30%_60%,rgba(255,255,255,0.25),transparent_55%)]" />
-        )}
+        <div className="absolute inset-0 bg-[radial-gradient(circle_at_30%_60%,rgba(255,255,255,0.25),transparent_55%)]" />
+        <BandPhoto src={band.photoUrl} alt={`${band.name} アー写`} priority />
         <div className="absolute inset-0 bg-gradient-to-b from-black/30 via-transparent to-black/85" />
 
         <div className="absolute left-0 right-0 top-0 flex items-center justify-between px-5 pt-5">

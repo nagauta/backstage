@@ -1,10 +1,10 @@
 "use client";
 
-import Image from "next/image";
 import Link from "next/link";
 import { useSyncExternalStore } from "react";
 import { BANDS } from "@/lib/bands";
 import { bandsStore } from "@/lib/flyerStore";
+import { BandPhoto } from "@/components/BandPhoto";
 
 export default function BandsPage() {
   const stored = useSyncExternalStore(
@@ -37,18 +37,8 @@ export default function BandsPage() {
               <div
                 className={`relative h-28 overflow-hidden bg-gradient-to-br ${band.hero.gradientFrom} ${band.hero.gradientTo}`}
               >
-                {band.photoUrl ? (
-                  <Image
-                    src={band.photoUrl}
-                    alt={`${band.name} アー写`}
-                    fill
-                    sizes="(max-width: 480px) 100vw, 430px"
-                    className="object-cover"
-                    unoptimized
-                  />
-                ) : (
-                  <div className="absolute inset-0 bg-[radial-gradient(circle_at_30%_50%,rgba(255,255,255,0.18),transparent_60%)]" />
-                )}
+                <div className="absolute inset-0 bg-[radial-gradient(circle_at_30%_50%,rgba(255,255,255,0.18),transparent_60%)]" />
+                <BandPhoto src={band.photoUrl} alt={`${band.name} アー写`} />
                 <div className="absolute inset-0 bg-gradient-to-t from-black/70 via-black/20 to-transparent" />
                 <div className="absolute right-3 top-3 rounded-full bg-black/40 px-2 py-0.5 font-mono text-[10px] text-white/80 backdrop-blur">
                   #{String(i + 1).padStart(2, "0")}

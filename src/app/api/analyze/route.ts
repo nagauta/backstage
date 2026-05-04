@@ -11,9 +11,17 @@ const SEARCH_CONTEXT_SIZE =
 const MAX_BANDS = Number(process.env.OPENAI_MAX_BANDS ?? "8");
 
 type AnalyzeRequest = { image?: string };
-type AnalyzeResponse =
-  | { ok: true; bands: Band[]; warnings?: string[] }
-  | { ok: false; error: string };
+type AnalyzeError = { ok: false; error: string };
+
+export type AnalyzeEvent =
+  | { type: "phase"; step: string; msg: string }
+  | { type: "vision_done"; names: string[] }
+  | { type: "band_start"; index: number; name: string }
+  | { type: "band_step"; index: number; msg: string }
+  | { type: "band_done"; index: number; band: Band }
+  | { type: "band_failed"; index: number; name: string; error: string }
+  | { type: "done"; bands: Band[]; warnings: string[] }
+  | { type: "fatal"; error: string };
 
 const HERO_PALETTES = [
   { gradientFrom: "from-indigo-900", gradientTo: "to-fuchsia-700", accent: "text-fuchsia-300" },
@@ -120,6 +128,10 @@ function log(rid: string, label: string, payload?: unknown) {
   console.log(`[analyze:${rid}] ${label}\n${body}`);
 }
 
+function errorJson(status: number, error: string) {
+  return Response.json({ ok: false, error } satisfies AnalyzeError, { status });
+}
+
 export async function POST(req: Request): Promise<Response> {
   const rid = newReqId();
   const tStart = Date.now();
@@ -127,103 +139,121 @@ export async function POST(req: Request): Promise<Response> {
 
   if (!process.env.OPENAI_API_KEY) {
     log(rid, "✖ missing OPENAI_API_KEY");
-    return Response.json(
-      { ok: false, error: "OPENAI_API_KEY is not set on the server." } satisfies AnalyzeResponse,
-      { status: 500 },
-    );
+    return errorJson(500, "OPENAI_API_KEY is not set on the server.");
   }
 
   let body: AnalyzeRequest;
   try {
     body = (await req.json()) as AnalyzeRequest;
   } catch {
-    return Response.json(
-      { ok: false, error: "Invalid JSON body." } satisfies AnalyzeResponse,
-      { status: 400 },
-    );
+    return errorJson(400, "Invalid JSON body.");
   }
 
   const image = body.image?.trim();
   if (!image || !image.startsWith("data:image/")) {
-    return Response.json(
-      { ok: false, error: "image (data URL) is required." } satisfies AnalyzeResponse,
-      { status: 400 },
-    );
+    return errorJson(400, "image (data URL) is required.");
   }
   log(rid, `image received (${image.length} chars)`);
 
-  const client = new OpenAI();
-  const warnings: string[] = [];
+  const encoder = new TextEncoder();
+  const stream = new ReadableStream<Uint8Array>({
+    async start(controller) {
+      const send = (event: AnalyzeEvent) => {
+        controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
+      };
 
-  // === Step 1: vision で出演バンド名抽出 ===
-  let names: string[];
-  const t1 = Date.now();
-  try {
-    names = await extractBandNames(client, image, rid);
-  } catch (err) {
-    log(rid, "✖ vision failed", { message: (err as Error).message });
-    return Response.json(
-      { ok: false, error: `vision: ${(err as Error).message}` } satisfies AnalyzeResponse,
-      { status: 502 },
-    );
-  }
-  log(rid, `① vision done in ${Date.now() - t1}ms`, { names });
+      const client = new OpenAI();
+      const warnings: string[] = [];
 
-  if (names.length === 0) {
-    log(rid, "✖ no band names detected");
-    return Response.json(
-      { ok: false, error: "No band names detected in the flyer." } satisfies AnalyzeResponse,
-      { status: 422 },
-    );
-  }
+      try {
+        // === Phase 1: vision ===
+        send({ type: "phase", step: "vision", msg: "フライヤーを解析中…" });
+        const t1 = Date.now();
+        const names = await extractBandNames(client, image, rid);
+        log(rid, `① vision done in ${Date.now() - t1}ms`, { names });
+        send({ type: "vision_done", names });
 
-  // === Step 2: 全バンドを並列でリサーチ ===
-  const targets = names.slice(0, MAX_BANDS);
-  if (names.length > MAX_BANDS) {
-    warnings.push(
-      `${names.length} bands detected; capped at ${MAX_BANDS}. Adjust OPENAI_MAX_BANDS to change.`,
-    );
-  }
-  log(rid, `② research+format start (${targets.length} bands in parallel)`, { targets });
-  const t2 = Date.now();
+        if (names.length === 0) {
+          send({ type: "fatal", error: "No band names detected in the flyer." });
+          controller.close();
+          return;
+        }
 
-  const results = await Promise.allSettled(
-    targets.map((name, i) => researchAndFormat(client, name, `${rid}#${i}`)),
-  );
+        const targets = names.slice(0, MAX_BANDS);
+        if (names.length > MAX_BANDS) {
+          warnings.push(
+            `${names.length} bands detected; capped at ${MAX_BANDS}. Adjust OPENAI_MAX_BANDS to change.`,
+          );
+        }
 
-  const bands: Band[] = [];
-  results.forEach((r, i) => {
-    const name = targets[i];
-    if (r.status === "fulfilled") {
-      bands.push(composeBand(r.value, name, i));
-    } else {
-      const msg = (r.reason as Error)?.message ?? String(r.reason);
-      log(rid, `✖ research failed for "${name}"`, { message: msg });
-      warnings.push(`research failed for "${name}": ${msg}`);
-    }
+        // === Phase 2: research bands in parallel ===
+        send({
+          type: "phase",
+          step: "research",
+          msg: `${targets.length}バンドのディープリサーチを並列実行中…`,
+        });
+        log(rid, `② research+format start (${targets.length} bands in parallel)`, {
+          targets,
+        });
+        const t2 = Date.now();
+
+        const slots: (Band | undefined)[] = new Array(targets.length).fill(undefined);
+
+        await Promise.all(
+          targets.map(async (name, i) => {
+            send({ type: "band_start", index: i, name });
+            try {
+              send({ type: "band_step", index: i, msg: "Web を検索中…" });
+              const formatted = await researchAndFormat(client, name, `${rid}#${i}`);
+              send({ type: "band_step", index: i, msg: "アー写を検証中…" });
+              const band = await composeBand(formatted, name, i, rid);
+              slots[i] = band;
+              send({ type: "band_done", index: i, band });
+            } catch (err) {
+              const msg = (err as Error).message;
+              log(rid, `✖ research failed for "${name}"`, { message: msg });
+              warnings.push(`research failed for "${name}": ${msg}`);
+              send({ type: "band_failed", index: i, name, error: msg });
+            }
+          }),
+        );
+
+        log(rid, `② research+format done in ${Date.now() - t2}ms`);
+
+        const bands = slots.filter((b): b is Band => Boolean(b));
+
+        if (bands.length === 0) {
+          send({
+            type: "fatal",
+            error: `research failed for all ${targets.length} bands. ${warnings.join(" / ")}`,
+          });
+          controller.close();
+          return;
+        }
+
+        log(rid, `✓ done in ${Date.now() - tStart}ms`, {
+          bandCount: bands.length,
+          bandNames: bands.map((b) => b.name),
+        });
+
+        send({ type: "done", bands, warnings });
+      } catch (err) {
+        log(rid, "✖ pipeline error", { message: (err as Error).message });
+        send({ type: "fatal", error: (err as Error).message });
+      } finally {
+        controller.close();
+      }
+    },
   });
 
-  log(rid, `② research+format done in ${Date.now() - t2}ms`, {
-    succeeded: bands.length,
-    failed: targets.length - bands.length,
+  return new Response(stream, {
+    headers: {
+      "Content-Type": "text/event-stream; charset=utf-8",
+      "Cache-Control": "no-cache, no-transform",
+      "Connection": "keep-alive",
+      "X-Accel-Buffering": "no",
+    },
   });
-
-  if (bands.length === 0) {
-    return Response.json(
-      {
-        ok: false,
-        error: `research failed for all ${targets.length} bands. ${warnings.join(" / ")}`,
-      } satisfies AnalyzeResponse,
-      { status: 502 },
-    );
-  }
-
-  log(rid, `✓ done in ${Date.now() - tStart}ms`, {
-    bandCount: bands.length,
-    bandNames: bands.map((b) => b.name),
-  });
-
-  return Response.json({ ok: true, bands, warnings } satisfies AnalyzeResponse);
 }
 
 async function extractBandNames(
@@ -315,7 +345,32 @@ async function researchAndFormat(
     "- members は現行ラインナップ。役割 (Vo/Gt 等) を括弧で添えてよい。",
     "- genres は最大4。",
     "- tagline は1文 (40字程度)、bio は3〜5文。",
-    "- photoUrl はバンドのアー写 (アーティスト写真) として使える画像の **直リンク URL**。公式サイト / Bandcamp / Spotify の artist image / Wikipedia / 信頼できる音楽メディアの記事内画像など、なるべく公式に近いものを優先。jpg / jpeg / png / webp の直 URL であること。見つからなければ空文字。HTML ページ URL は不可。",
+    "- photoUrl は **画像ファイルへの直リンク URL**。最重要かつ最も間違いやすい項目。",
+    "",
+    "  ⚠️ **絶対の禁忌**: あなたは Spotify CDN (https://i.scdn.co/image/<hash>) や Apple Music CDN (https://*.mzstatic.com/...) の URL **パターン**を学習で知っているが、",
+    "  個別バンドの hash 部分は知らない。それを **想像で埋めて URL を構築するのは捏造であり厳禁**。実際にツール出力で目にした文字列のみ返すこと。",
+    "  「i.scdn.co/image/ で始まるはずだから ab6761610000e5eb の後に適当な 24文字足そう」のような行為を絶対にしない。",
+    "",
+    "  正しい入手手順:",
+    "    1) web_search で `${bandName} site:open.spotify.com` または `${bandName} spotify` を検索",
+    "    2) **必ず open_page アクションでアーティストページを開く** (https://open.spotify.com/artist/xxxxx)",
+    "    3) 開いたページの HTML 内から `<meta property=\"og:image\" content=\"https://i.scdn.co/image/...\">` をそのまま読み取る",
+    "    4) その content 値をそのまま photoUrl に入れる (1文字も改変しない)",
+    "  Wikipedia / 音楽メディア記事も同じ要領: open_page してから og:image, twitter:image, または記事中の <img src> を抽出。",
+    "",
+    "  受け入れ可能な URL のソース:",
+    "    - i.scdn.co/image/...  (Spotify。og:image から取得した実物のみ)",
+    "    - is*-ssl.mzstatic.com/image/...  (Apple Music の実物)",
+    "    - upload.wikimedia.org/wikipedia/commons/...  (Wikimedia の実物)",
+    "    - 音楽メディア記事 (natalie.mu, rockinon.com 等) の <img> src の実物",
+    "    - 公式サイト・Bandcamp・SoundCloud の <img> src の実物",
+    "",
+    "  ダメな URL (絶対に返さない):",
+    "    - 自分で組み立てた CDN 風 URL",
+    "    - https://open.spotify.com/artist/...  (HTML ページ — og:image を読んでから i.scdn.co URL を返すこと)",
+    "    - https://ja.wikipedia.org/wiki/...    (HTML ページ)",
+    "",
+    "  実在を確信できない URL は **必ず空文字** を返す。捏造より空が圧倒的に良い。",
     "- tracks は代表曲 (最大3): title / album / year(数字) / description (1〜2文)。",
     "- interview は、Web 上で見つかった**実在のインタビュー記事から**の Q&A 抜粋のみ (最大3)。各項目に source として記事 URL を必ず付ける。回答は原文に近い表現で、過度に意訳しない。インタビュー記事が見つからなければ interview は空配列で返す (絶対に捏造しない)。",
     "- links は公式サイト / SNS / Bandcamp / Spotify など最大6 (label と url)。",
@@ -344,7 +399,6 @@ async function researchAndFormat(
     },
   });
 
-  // 検索ツールの利用回数 (ログ用)
   let searchCalls = 0;
   for (const item of resp.output ?? []) {
     if (item.type === "web_search_call") searchCalls++;
@@ -357,7 +411,68 @@ async function researchAndFormat(
   return JSON.parse(text) as FormattedBand;
 }
 
-function composeBand(f: FormattedBand, fallbackName: string, paletteIndex: number): Band {
+const BROWSER_UA =
+  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
+
+/**
+ * 画像 URL を厳格に検証。LLM が CDN URL パターンを捏造する事故を確実に潰すため
+ * 4xx/5xx は一切通さない。CDN がボットを弾くケースは User-Agent をブラウザ風にして対処。
+ */
+async function validateImageUrl(url: string, rid: string): Promise<boolean> {
+  if (!url) return false;
+  if (!/^https?:\/\//i.test(url)) {
+    log(rid, "photoUrl rejected (not http/https)", url);
+    return false;
+  }
+  // HTML ページが明らかな URL を事前ブロック
+  if (/^https?:\/\/(open\.spotify\.com|[a-z]{2,3}\.wikipedia\.org)\//i.test(url)) {
+    log(rid, "photoUrl rejected (HTML page, not image)", url);
+    return false;
+  }
+
+  try {
+    const ac = new AbortController();
+    const timer = setTimeout(() => ac.abort(), 5000);
+    const res = await fetch(url, {
+      method: "GET",
+      signal: ac.signal,
+      redirect: "follow",
+      headers: {
+        Range: "bytes=0-0",
+        "User-Agent": BROWSER_UA,
+        Accept: "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+      },
+    });
+    clearTimeout(timer);
+
+    const ct = (res.headers.get("content-type") ?? "").toLowerCase();
+    if (!res.ok && res.status !== 206) {
+      log(rid, `photoUrl REJECTED (status ${res.status})`, url);
+      return false;
+    }
+    if (ct.startsWith("image/")) {
+      log(rid, `photoUrl OK (${ct})`, url);
+      return true;
+    }
+    if (ct.startsWith("text/")) {
+      log(rid, `photoUrl REJECTED (text content-type: ${ct})`, url);
+      return false;
+    }
+    // image/ でも text/* でもない (application/octet-stream など) は通す
+    log(rid, `photoUrl OK (ambiguous ct=${ct})`, url);
+    return true;
+  } catch (err) {
+    log(rid, `photoUrl REJECTED (fetch failed: ${(err as Error).message})`, url);
+    return false;
+  }
+}
+
+async function composeBand(
+  f: FormattedBand,
+  fallbackName: string,
+  paletteIndex: number,
+  rid: string,
+): Promise<Band> {
   const palette = HERO_PALETTES[paletteIndex % HERO_PALETTES.length];
 
   const tracks: Track[] = (f.tracks ?? []).slice(0, 3).map((t) => ({
@@ -378,8 +493,8 @@ function composeBand(f: FormattedBand, fallbackName: string, paletteIndex: numbe
     url: String(l.url ?? "#"),
   }));
 
-  const photoUrl = (f.photoUrl ?? "").trim();
-  const photoOk = /^https?:\/\/.+\.(jpe?g|png|webp|gif|avif)(\?|$)/i.test(photoUrl);
+  const photoCandidate = (f.photoUrl ?? "").trim();
+  const photoOk = await validateImageUrl(photoCandidate, rid);
 
   return {
     id: slugify(f.name || fallbackName),
@@ -391,7 +506,7 @@ function composeBand(f: FormattedBand, fallbackName: string, paletteIndex: numbe
     genres: (f.genres ?? []).map(String).filter(Boolean),
     tagline: f.tagline || "",
     hero: palette,
-    photoUrl: photoOk ? photoUrl : undefined,
+    photoUrl: photoOk ? photoCandidate : undefined,
     bio: f.bio || "",
     interview,
     tracks,

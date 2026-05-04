@@ -1,5 +1,11 @@
 import OpenAI from "openai";
 import type { Band, QA, Track, RelatedLink } from "@/lib/bands";
+import {
+  isSpotifyConfigured,
+  searchArtist,
+  searchTrack,
+  type SpotifyArtist,
+} from "@/lib/spotify";
 
 export const runtime = "nodejs";
 export const maxDuration = 300;
@@ -569,7 +575,13 @@ type ProfileFields = {
   genres: string[];
   tagline: string;
   bio: string;
-  tracks: { title: string; album: string; year: number; description: string }[];
+  tracks: {
+    title: string;
+    album: string;
+    year: number;
+    description: string;
+    spotifyUrl?: string; // Spotify enrich 後に付与される (LLM スキーマ側には乗らない)
+  }[];
   links: { label: string; url: string }[];
 };
 
@@ -594,6 +606,15 @@ async function researchBandParallel(
     );
   };
   renderStep();
+
+  // Spotify artist 検索: photo 候補 + track enrich + links 補正に使う。
+  // 設定が無ければ常に null を返すスタブ。失敗は soft fail。
+  const spotifyArtistP: Promise<SpotifyArtist | null> = isSpotifyConfigured()
+    ? searchArtist(bandName).catch((e: Error) => {
+        log(rid, "spotify artist search failed (soft)", { message: e.message });
+        return null;
+      })
+    : Promise.resolve(null);
 
   const profileP = fetchProfile(client, bandName, rid).then(
     (r) => {
@@ -622,7 +643,7 @@ async function researchBandParallel(
     },
   );
 
-  const photoP = fetchPhotoUrl(client, bandName, rid).then(
+  const photoP = fetchPhotoUrl(client, bandName, rid, spotifyArtistP).then(
     (r) => {
       status.photo = "done";
       renderStep();
@@ -639,10 +660,56 @@ async function researchBandParallel(
   const profile = await profileP;
   const interview = await interviewP;
   const photoCandidate = await photoP;
+  const spotifyArtist = await spotifyArtistP;
 
   const photoOk = await validateImageUrl(photoCandidate, rid);
 
-  return composeBand(profile, interview, photoOk ? photoCandidate : undefined, bandName, paletteIndex);
+  // 代表曲を Spotify track 検索で enrich (spotifyUrl 付与)
+  const enrichedTracks = await enrichTracksWithSpotify(
+    profile.tracks,
+    spotifyArtist,
+    rid,
+  );
+
+  return composeBand(
+    { ...profile, tracks: enrichedTracks },
+    interview,
+    photoOk ? photoCandidate : undefined,
+    bandName,
+    paletteIndex,
+    spotifyArtist?.externalUrl,
+  );
+}
+
+async function enrichTracksWithSpotify(
+  tracks: ProfileFields["tracks"],
+  spotifyArtist: SpotifyArtist | null,
+  rid: string,
+): Promise<ProfileFields["tracks"]> {
+  if (!spotifyArtist || tracks.length === 0) return tracks;
+  return Promise.all(
+    tracks.map(async (t) => {
+      try {
+        const sp = await searchTrack({
+          artistName: spotifyArtist.name,
+          artistId: spotifyArtist.id,
+          title: t.title,
+        });
+        if (sp) {
+          log(
+            rid,
+            `spotify track match: "${t.title}" → "${sp.name}" (${sp.externalUrl})`,
+          );
+          return { ...t, spotifyUrl: sp.externalUrl };
+        }
+        log(rid, `spotify track miss: "${t.title}" (artist=${spotifyArtist.name})`);
+        return t;
+      } catch (err) {
+        log(rid, `spotify track search failed for "${t.title}": ${(err as Error).message}`);
+        return t;
+      }
+    }),
+  );
 }
 
 // =========================================================================
@@ -754,7 +821,23 @@ async function fetchPhotoUrl(
   client: OpenAI,
   bandName: string,
   rid: string,
+  spotifyArtistP: Promise<SpotifyArtist | null>,
 ): Promise<string> {
+  // ⓪ Spotify アーティスト画像 (高確度) を最優先で試す
+  const spotifyArtist = await spotifyArtistP;
+  if (spotifyArtist?.imageUrl) {
+    const ok = await validateImageUrl(spotifyArtist.imageUrl, rid);
+    if (ok) {
+      log(
+        rid,
+        `photo: using Spotify artist image (followers=${spotifyArtist.followers}, popularity=${spotifyArtist.popularity})`,
+        spotifyArtist.imageUrl,
+      );
+      return spotifyArtist.imageUrl;
+    }
+    log(rid, "photo: Spotify image failed validation, falling back to LLM");
+  }
+
   // ① LLM (web_search) で候補を収集
   const candidates = await gatherPhotoCandidates(client, bandName, rid);
   log(rid, `photo: ${candidates.length} candidates from LLM`);
@@ -1008,6 +1091,7 @@ function composeBand(
   photoUrl: string | undefined,
   fallbackName: string,
   paletteIndex: number,
+  spotifyArtistUrl?: string,
 ): Band {
   const palette = HERO_PALETTES[paletteIndex % HERO_PALETTES.length];
 
@@ -1016,6 +1100,7 @@ function composeBand(
     album: String(t.album ?? ""),
     year: Number(t.year) || 0,
     description: String(t.description ?? ""),
+    spotifyUrl: t.spotifyUrl || undefined,
   }));
 
   const interviewClean: QA[] = (interview ?? []).slice(0, 3).map((qa) => ({
@@ -1029,6 +1114,19 @@ function composeBand(
     url: String(l.url ?? "#"),
   }));
 
+  // Spotify API で確定した URL があれば、LLM 由来の Spotify リンクを差し替え (or 追加)
+  if (spotifyArtistUrl) {
+    const idx = links.findIndex(
+      (l) => /spotify/i.test(l.label) || /open\.spotify\.com/.test(l.url),
+    );
+    if (idx >= 0) {
+      links[idx] = { label: "Spotify", url: spotifyArtistUrl };
+    } else {
+      links.unshift({ label: "Spotify", url: spotifyArtistUrl });
+      if (links.length > 6) links.length = 6;
+    }
+  }
+
   return {
     id: slugify(profile.name || fallbackName),
     name: profile.name || fallbackName,
@@ -1040,6 +1138,7 @@ function composeBand(
     tagline: profile.tagline || "",
     hero: palette,
     photoUrl: photoUrl || undefined,
+    spotifyArtistUrl: spotifyArtistUrl || undefined,
     bio: profile.bio || "",
     interview: interviewClean,
     tracks,

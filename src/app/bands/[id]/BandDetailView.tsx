@@ -9,6 +9,14 @@ import { BandPhoto } from "@/components/BandPhoto";
 
 type Props = { bandId: string };
 
+// https://open.spotify.com/track/{ID} → https://open.spotify.com/embed/track/{ID}
+function spotifyEmbedSrc(url: string | undefined): string | null {
+  if (!url) return null;
+  const m = url.match(/^https:\/\/open\.spotify\.com\/(track|album|playlist|episode|show)\/([A-Za-z0-9]+)/);
+  if (!m) return null;
+  return `https://open.spotify.com/embed/${m[1]}/${m[2]}?utm_source=generator`;
+}
+
 export default function BandDetailView({ bandId }: Props) {
   const router = useRouter();
   const stored = useSyncExternalStore(
@@ -212,7 +220,7 @@ export default function BandDetailView({ bandId }: Props) {
                 <div className="flex h-10 w-10 flex-none items-center justify-center rounded-full bg-zinc-800 font-mono text-sm text-zinc-300">
                   {String(i + 1).padStart(2, "0")}
                 </div>
-                <div className="min-w-0">
+                <div className="min-w-0 flex-1">
                   <h4 className="text-sm font-semibold text-white">{t.title}</h4>
                   <p className="mt-0.5 text-[11px] text-zinc-500">
                     {[t.album, t.year > 0 ? t.year : null]
@@ -224,6 +232,23 @@ export default function BandDetailView({ bandId }: Props) {
                       {t.description}
                     </p>
                   )}
+                  {(() => {
+                    const embedSrc = spotifyEmbedSrc(t.spotifyUrl);
+                    return embedSrc ? (
+                      <div className="mt-3">
+                        <iframe
+                          src={embedSrc}
+                          width="100%"
+                          height={152}
+                          loading="lazy"
+                          allow="autoplay; clipboard-write; encrypted-media; fullscreen; picture-in-picture"
+                          className="rounded-xl"
+                          style={{ border: 0 }}
+                          title={`${t.title} on Spotify`}
+                        />
+                      </div>
+                    ) : null;
+                  })()}
                 </div>
               </li>
             ))}

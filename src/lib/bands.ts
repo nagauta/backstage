@@ -3,6 +3,7 @@ export type Track = {
   album: string;
   year: number;
   description: string;
+  spotifyUrl?: string;
 };
 
 export type QA = {
@@ -31,6 +32,7 @@ export type Band = {
     accent: string;
   };
   photoUrl?: string;
+  spotifyArtistUrl?: string;
   bio: string;
   interview: QA[];
   tracks: Track[];

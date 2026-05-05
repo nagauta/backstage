@@ -1,4 +1,14 @@
+import { createHash, randomUUID } from "node:crypto";
+
+import { eq } from "drizzle-orm";
 import OpenAI from "openai";
+
+import { db } from "@/db";
+import {
+  artists as artistsTable,
+  gigArtists as gigArtistsTable,
+  gigs as gigsTable,
+} from "@/db/schema";
 import type { Band, QA, Track, RelatedLink } from "@/lib/bands";
 import {
   isSpotifyConfigured,
@@ -43,7 +53,7 @@ export type AnalyzeEvent =
   | { type: "band_step"; index: number; msg: string }
   | { type: "band_done"; index: number; band: Band }
   | { type: "band_failed"; index: number; name: string; error: string }
-  | { type: "done"; bands: Band[]; warnings: string[] }
+  | { type: "done"; bands: Band[]; warnings: string[]; gigSlug: string }
   | { type: "fatal"; error: string };
 
 const HERO_PALETTES = [
@@ -412,7 +422,26 @@ export async function POST(req: Request): Promise<Response> {
           bandNames: bands.map((b) => b.name),
         });
 
-        send({ type: "done", bands, warnings });
+        // === Phase 3: persist to DB ===
+        send({ type: "phase", step: "persist", msg: "DB に保存中…" });
+        let gigSlug: string;
+        try {
+          const result = await persistGig({
+            bands,
+            eventInfo: verifyEventInfo,
+            warnings,
+            flyerHash: sha256Hex(image),
+          });
+          gigSlug = result.slug;
+          log(rid, "✓ persisted gig", result);
+        } catch (err) {
+          const msg = (err as Error).message;
+          log(rid, "✖ persistence failed", { message: msg });
+          send({ type: "fatal", error: `DB persistence failed: ${msg}` });
+          return;
+        }
+
+        send({ type: "done", bands, warnings, gigSlug });
       } catch (err) {
         log(rid, "✖ pipeline error", { message: (err as Error).message });
         send({ type: "fatal", error: (err as Error).message });
@@ -1144,4 +1173,154 @@ function composeBand(
     tracks,
     links,
   };
+}
+
+// =========================================================================
+// Persistence: write gig + artists + gig_artists.
+// status は常に "draft"。flyerHash 一致の既存 gig があれば全フィールド上書き。
+// =========================================================================
+
+function sha256Hex(input: string): string {
+  return createHash("sha256").update(input).digest("hex");
+}
+
+async function uniqueGigSlug(base: string): Promise<string> {
+  const seed = base || `gig-${randomUUID().slice(0, 8)}`;
+  for (let i = 0; i < 1000; i++) {
+    const candidate = i === 0 ? seed : `${seed}-${i + 1}`;
+    const hit = await db
+      .select({ id: gigsTable.id })
+      .from(gigsTable)
+      .where(eq(gigsTable.slug, candidate))
+      .limit(1);
+    if (hit.length === 0) return candidate;
+  }
+  return `${seed}-${randomUUID().slice(0, 6)}`;
+}
+
+async function persistGig(params: {
+  bands: Band[];
+  eventInfo: VerifyEventInfo;
+  warnings: string[];
+  flyerHash: string;
+}): Promise<{ slug: string; gigId: string }> {
+  const { bands, eventInfo, warnings, flyerHash } = params;
+  const now = Date.now();
+
+  // 同一 band id (= slug) が複数回 verify を通り得るので除外
+  const seen = new Set<string>();
+  const uniqueBands = bands.filter((b) => {
+    if (seen.has(b.id)) return false;
+    seen.add(b.id);
+    return true;
+  });
+
+  // 1) artists upsert
+  for (const b of uniqueBands) {
+    await db
+      .insert(artistsTable)
+      .values({
+        id: b.id,
+        slug: b.id,
+        name: b.name,
+        reading: b.reading,
+        formedYear: b.formedYear,
+        origin: b.origin,
+        tagline: b.tagline,
+        bio: b.bio,
+        photoUrl: b.photoUrl ?? null,
+        spotifyArtistUrl: b.spotifyArtistUrl ?? null,
+        members: b.members,
+        genres: b.genres,
+        tracks: b.tracks,
+        interview: b.interview,
+        links: b.links,
+        researchedAt: now,
+        createdAt: now,
+        updatedAt: now,
+      })
+      .onConflictDoUpdate({
+        target: artistsTable.id,
+        set: {
+          name: b.name,
+          reading: b.reading,
+          formedYear: b.formedYear,
+          origin: b.origin,
+          tagline: b.tagline,
+          bio: b.bio,
+          photoUrl: b.photoUrl ?? null,
+          spotifyArtistUrl: b.spotifyArtistUrl ?? null,
+          members: b.members,
+          genres: b.genres,
+          tracks: b.tracks,
+          interview: b.interview,
+          links: b.links,
+          researchedAt: now,
+          updatedAt: now,
+        },
+      });
+  }
+
+  // 2) gigs: flyerHash で既存検索 → 上書き or 新規
+  const [existing] = await db
+    .select()
+    .from(gigsTable)
+    .where(eq(gigsTable.flyerHash, flyerHash))
+    .limit(1);
+
+  let gigId: string;
+  let slug: string;
+
+  if (existing) {
+    gigId = existing.id;
+    slug = existing.slug;
+    await db.delete(gigArtistsTable).where(eq(gigArtistsTable.gigId, gigId));
+    await db
+      .update(gigsTable)
+      .set({
+        status: "draft",
+        title: eventInfo.title || existing.title,
+        date: eventInfo.date || null,
+        venue: eventInfo.venue || null,
+        sourceUrl: eventInfo.sourceUrl || null,
+        aiWarnings: warnings,
+        analyzedAt: now,
+        updatedAt: now,
+      })
+      .where(eq(gigsTable.id, gigId));
+  } else {
+    gigId = `gig_${randomUUID().replace(/-/g, "").slice(0, 12)}`;
+    const slugBase = eventInfo.title ? slugify(eventInfo.title) : "gig";
+    slug = await uniqueGigSlug(slugBase);
+    await db.insert(gigsTable).values({
+      id: gigId,
+      slug,
+      status: "draft",
+      flyerUrl: null,
+      flyerHash,
+      title: eventInfo.title || "",
+      date: eventInfo.date || null,
+      venue: eventInfo.venue || null,
+      sourceUrl: eventInfo.sourceUrl || null,
+      intro: "",
+      aiWarnings: warnings,
+      analyzedAt: now,
+      createdAt: now,
+      updatedAt: now,
+      publishedAt: null,
+    });
+  }
+
+  // 3) gig_artists 再構築
+  if (uniqueBands.length > 0) {
+    await db.insert(gigArtistsTable).values(
+      uniqueBands.map((b, i) => ({
+        gigId,
+        artistId: b.id,
+        position: i,
+      })),
+    );
+  }
+
+  return { gigId, slug };
 }

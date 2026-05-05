@@ -4,7 +4,6 @@ import { drizzle } from "drizzle-orm/libsql";
 import * as schema from "./schema";
 
 declare global {
-  // eslint-disable-next-line no-var
   var __libsqlClient__: Client | undefined;
 }
 
